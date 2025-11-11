@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MÖRK BORG :: Online Misery</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Load Firebase 11.6.1 SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            signInAnonymously, 
+            signInWithCustomToken, 
+            onAuthStateChanged 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            doc, 
+            onSnapshot, 
+            setDoc,
+            updateDoc,
+            arrayUnion,
+            runTransaction,
+            setLogLevel
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- CONFIG & STATE ---
+        let db, auth, app;
+        let currentUserId = null;
+        let appState = {
+            log: [],
+            characters: {}
+        };
+        
+        // Get App ID and Firebase Config from environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-mork-borg-app';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+
+        // --- DOM ELEMENTS ---
+        const diceButtons = [
+            { id: 'roll-d2', faces: 2 },
+            { id: 'roll-d4', faces: 4 },
+            { id: 'roll-d6', faces: 6 },
+            { id: 'roll-d8', faces: 8 },
+            { id: 'roll-d10', faces: 10 },
+            { id: 'roll-d12', faces: 12 },
+            { id: 'roll-d20', faces: 20 },
+            { id: 'roll-d100', faces: 100 }
+        ];
+        const logContainer = document.getElementById('log-container');
+        const charactersContainer = document.getElementById('characters-container');
+        const userIdDisplay = document.getElementById('user-id-display');
+        const gameIdDisplay = document.getElementById('game-id-display');
+        const loadingOverlay = document.getElementById('loading-overlay');
+        const characterForm = document.getElementById('character-form');
+        
+        // --- CORE FUNCTIONS ---
+
+        /**
+         * Initialize Firebase app, auth, and Firestore
+         * Then, sign in the user.
+         */
+        async function initializeFirebase() {
+            try {
+                // setLogLevel('debug');
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // Show App/Game ID
+                gameIdDisplay.textContent = appId;
+
+                // Listen for auth state changes
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        currentUserId = user.uid;
+                        userIdDisplay.textContent = currentUserId;
+                        
+                        // User is signed in, now we can connect to Firestore
+                        setupFirestoreListener();
+                        setupDiceRollers();
+                        setupCharacterFormListener();
+
+                    } else {
+                        // User is signed out, try to sign in
+                        await signIn();
+                    }
+                });
+
+                // Initial sign-in attempt
+                if (!auth.currentUser) {
+                    await signIn();
+                }
+
+            } catch (error) {
+                console.error("Firebase Init Error:", error);
+                logMessageToUI("SYSTEM", `FATAL ERROR: ${error.message}`);
+                loadingOverlay.textContent = "FIREBASE CONNECTION FAILED. REFRESH TO TRY AGAIN.";
+            }
+        }
+
+        /**
+         * Sign in the user, either with a custom token or anonymously.
+         */
+        async function signIn() {
+            try {
+                if (typeof __initial_auth_token !== 'undefined') {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Authentication Error:", error);
+                logMessageToUI("SYSTEM", `AUTH ERROR: ${error.message}`);
+                loadingOverlay.textContent = "AUTHENTICATION FAILED. REFRESH TO TRY AGAIN.";
+            }
+        }
+
+        /**
+         * Set up the real-time listener on the main gamestate document.
+         */
+        function setupFirestoreListener() {
+            const docRef = getGamestateRef();
+            
+            onSnapshot(docRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    appState = docSnap.data();
+                    
+                    // Ensure state has default structure
+                    if (!appState.log) appState.log = [];
+                    if (!appState.characters) appState.characters = {};
+
+                } else {
+                    // Document doesn't exist, create it with default state
+                    console.log("No gamestate doc, creating one.");
+                    setDoc(docRef, appState).catch(e => console.error("Error creating doc:", e));
+                }
+                
+                // Render the UI with the new state
+                renderLog();
+                renderCharacters();
+                
+                // Hide loading overlay once we have a connection
+                loadingOverlay.classList.add('opacity-0', 'pointer-events-none');
+
+            }, (error) => {
+                console.error("Firestore Snapshot Error:", error);
+                logMessageToUI("SYSTEM", `CONNECTION ERROR: ${error.message}`);
+            });
+        }
+
+        /**
+         * Get the reference to the single gamestate document for this app.
+         */
+        function getGamestateRef() {
+            return doc(db, `artifacts/${appId}/public/data/gamestate`);
+        }
+
+        /**
+         * Add event listeners to all dice roller buttons.
+         */
+        function setupDiceRollers() {
+            diceButtons.forEach(button => {
+                const el = document.getElementById(button.id);
+                if (el) {
+                    el.addEventListener('click', () => handleDiceRoll(button.faces));
+                }
+            });
+        }
+
+        /**
+         * Handle a dice roll, log it, and update Firestore.
+         */
+        async function handleDiceRoll(faces) {
+            if (!currentUserId) return;
+
+            const roll = Math.floor(Math.random() * faces) + 1;
+            const userName = appState.characters[currentUserId]?.name || `SCVM-${currentUserId.substring(0, 4)}`;
+            
+            const newMessage = {
+                timestamp: Date.now(),
+                user: userName,
+                message: `rolled a d${faces}: ${roll}`
+            };
+
+            // Use a transaction to update the log to prevent race conditions
+            // This reads the current log, adds the new message, trims it, and writes it back.
+            const docRef = getGamestateRef();
+            try {
+                await runTransaction(db, async (transaction) => {
+                    const sfDoc = await transaction.get(docRef);
+                    if (!sfDoc.exists()) {
+                        // Doc doesn't exist, just create it with this log message
+                        transaction.set(docRef, { 
+                            ...appState, // Use local app state as base
+                            log: [newMessage] 
+                        });
+                    } else {
+                        // Doc exists, update the log array
+                        const currentData = sfDoc.data();
+                        let newLog = currentData.log || [];
+                        newLog.push(newMessage);
+                        
+                        // Keep log from getting too big
+                        if (newLog.length > 50) {
+                            newLog = newLog.slice(newLog.length - 50);
+                        }
+                        transaction.update(docRef, { log: newLog });
+                    }
+                });
+            } catch (error) {
+                console.error("Dice Roll Transaction Error: ", error);
+                logMessageToUI("SYSTEM", `DICE ROLL FAILED: ${error.message}`);
+            }
+        }
+        
+        /**
+         * Add a blur/change listener to the character form to save data.
+         */
+        function setupCharacterFormListener() {
+            if (characterForm) {
+                // Save on any 'change' event (e.g., blur from input)
+                characterForm.addEventListener('change', saveCharacterData);
+                // Also save on keyup for textareas
+                characterForm.querySelector('textarea').addEventListener('keyup', saveCharacterData);
+            }
+        }
+
+        /**
+         * Save the current user's character sheet data to Firestore.
+         */
+        async function saveCharacterData() {
+            if (!currentUserId || !characterForm) return;
+
+            const formData = new FormData(characterForm);
+            const characterData = {
+                name: formData.get('char-name') || `SCVM-${currentUserId.substring(0, 4)}`,
+                hp: formData.get('char-hp') || 0,
+                omens: formData.get('char-omens') || 0,
+                agility: formData.get('char-agility') || 0,
+                presence: formData.get('char-presence') || 0,
+                strength: formData.get('char-strength') || 0,
+                toughness: formData.get('char-toughness') || 0,
+                notes: formData.get('char-notes') || ''
+            };
+            
+            // Update the local state immediately for responsiveness
+            appState.characters[currentUserId] = characterData;
+            
+            // Save to Firestore using set with merge
+            // This updates *only* our character in the 'characters' map
+            const docRef = getGamestateRef();
+            try {
+                await setDoc(docRef, {
+                    characters: {
+                        [currentUserId]: characterData
+                    }
+                }, { merge: true });
+            } catch (error) {
+                console.error("Save Character Error: ", error);
+                logMessageToUI("SYSTEM", `SAVE FAILED: ${error.message}`);
+            }
+        }
+
+
+        // --- RENDER FUNCTIONS ---
+
+        /**
+         * Render the shared log.
+         */
+        function renderLog() {
+            if (!logContainer || !appState.log) return;
+            
+            logContainer.innerHTML = appState.log
+                .map(entry => {
+                    const time = new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                    return `<div class="mb-1"><span class="text-neutral-500 mr-2">[${time}]</span><span class="text-fuchsia-400 mr-2">${entry.user}:</span><span class="text-white">${entry.message}</span></div>`;
+                })
+                .join('');
+            
+            // Auto-scroll to bottom
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+
+        /**
+         * Render all character sheets, and populate the local user's form.
+         */
+        function renderCharacters() {
+            if (!charactersContainer) return;
+            
+            // Clear previous renders except for the current user's form
+            charactersContainer.innerHTML = '';
+            
+            let currentUserData = null;
+
+            for (const [userId, char] of Object.entries(appState.characters)) {
+                if (userId === currentUserId) {
+                    // This is the local user. Store their data to populate the form.
+                    currentUserData = char;
+                } else {
+                    // This is a remote user. Render a read-only sheet for them.
+                    const charElement = document.createElement('div');
+                    charElement.className = "bg-neutral-900 border border-neutral-700 p-4";
+                    charElement.innerHTML = `
+                        <h3 class="text-lg text-yellow-300 font-bold tracking-widest uppercase mb-3">${char.name || '...'}</h3>
+                        <div class="grid grid-cols-2 gap-2 text-sm">
+                            <div class="text-neutral-400">HP: <span class="text-white font-bold ml-1">${char.hp}</span></div>
+                            <div class="text-neutral-400">OMENS: <span class="text-white font-bold ml-1">${char.omens}</span></div>
+                        </div>
+                        <div class="grid grid-cols-4 gap-1 mt-3 text-center">
+                            <div>
+                                <div class="text-neutral-500 text-xs">AGI</div>
+                                <div class="text-white text-lg">${char.agility}</div>
+                            </div>
+                            <div>
+                                <div class="text-neutral-500 text-xs">PRE</div>
+                                <div class="text-white text-lg">${char.presence}</div>
+                            </div>
+                            <div>
+                                <div class="text-neutral-500 text-xs">STR</div>
+                                <div class="text-white text-lg">${char.strength}</div>
+                            </div>
+                            <div>
+                                <div class="text-neutral-500 text-xs">TOU</div>
+                                <div class="text-white text-lg">${char.toughness}</div>
+                            </div>
+                        </div>
+                        <p class="text-neutral-300 text-sm mt-3 whitespace-pre-wrap">${char.notes || ''}</p>
+                    `;
+                    charactersContainer.appendChild(charElement);
+                }
+            }
+            
+            // Populate the local user's form
+            if (characterForm) {
+                characterForm.elements['char-name'].value = currentUserData?.name || `SCVM-${currentUserId.substring(0, 4)}`;
+                characterForm.elements['char-hp'].value = currentUserData?.hp || 0;
+                characterForm.elements['char-omens'].value = currentUserData?.omens || 0;
+                characterForm.elements['char-agility'].value = currentUserData?.agility || 0;
+                characterForm.elements['char-presence'].value = currentUserData?.presence || 0;
+                characterForm.elements['char-strength'].value = currentUserData?.strength || 0;
+                characterForm.elements['char-toughness'].value = currentUserData?.toughness || 0;
+                characterForm.elements['char-notes'].value = currentUserData?.notes || '';
+            }
+        }
+        
+        /**
+         * Helper to show system messages in the log.
+         */
+        function logMessageToUI(user, message) {
+            const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const html = `<div class="mb-1"><span class="text-neutral-500 mr-2">[${time}]</span><span class="text-red-500 mr-2">${user}:</span><span class="text-white">${message}</span></div>`;
+            logContainer.innerHTML += html;
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+
+        // --- STARTUP ---
+        // Wait for the DOM to be ready, then initialize Firebase
+        document.addEventListener('DOMContentLoaded', initializeFirebase);
+
+    </script>
+
+    <!-- 
+    Mörk Borg-inspired styles.
+    We are using 'Inter' but styling it to be harsh, sharp, and uncomfortable.
+    - No rounded corners.
+    - High contrast: black, white, neon yellow, neon pink.
+    - Aggressive letter-spacing and all-caps.
+    -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
+        
+        body {
+            font-family: 'Inter', 'Courier New', monospace;
+            background-color: #000000;
+            color: #ffffff;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+        
+        /* Custom "glitch" or "distress" feel for headers */
+        .header-title {
+            font-weight: 900;
+            text-transform: uppercase;
+            letter-spacing: 0.2em;
+            color: #ffff00; /* Mörk Borg Yellow */
+            text-shadow: 
+                1px 1px 0px #ff00ff, /* Mörk Borg Pink */
+                -1px -1px 0px #ff00ff;
+            animation: flicker 5s infinite steps(1);
+        }
+
+        @keyframes flicker {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.8; }
+            50.1% { opacity: 1; }
+            75% { opacity: 0.9; }
+            75.1% { opacity: 1; }
+        }
+
+        /* All borders sharp */
+        .border {
+            border-width: 1px;
+        }
+        
+        /* Style form inputs */
+        .form-input {
+            background-color: #1a1a1a;
+            border: 1px solid #444;
+            color: #ffffff;
+            padding: 0.5rem 0.75rem;
+            width: 100%;
+        }
+        .form-input:focus {
+            outline: none;
+            border-color: #ffff00;
+            box-shadow: 0 0 10px #ffff00;
+        }
+        .form-input::placeholder {
+            color: #777;
+        }
+        
+        /* Style buttons */
+        .btn-dice {
+            background-color: #1a1a1a;
+            border: 1px solid #444;
+            color: #ffff00;
+            font-weight: 700;
+            text-transform: uppercase;
+            padding: 0.5rem 0.75rem;
+            transition: all 0.1s ease-in-out;
+        }
+        .btn-dice:hover {
+            background-color: #ffff00;
+            color: #000000;
+            border-color: #ffff00;
+            transform: translate(1px, 1px);
+        }
+        .btn-dice:active {
+            transform: translate(0px, 0px);
+        }
+        
+        /* Custom scrollbar for the log */
+        #log-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        #log-container::-webkit-scrollbar-track {
+            background: #1a1a1a;
+        }
+        #log-container::-webkit-scrollbar-thumb {
+            background: #ffff00;
+        }
+        #log-container::-webkit-scrollbar-thumb:hover {
+            background: #ff00ff;
+        }
+    </style>
+</head>
+
+<body class="bg-black text-white p-4 md:p-8">
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay" class="fixed inset-0 bg-black bg-opacity-90 flex items-center justify-center z-50 transition-opacity duration-500">
+        <div class="text-yellow-300 text-2xl font-bold uppercase tracking-widest animate-pulse">
+            CONNECTING TO THE VOID...
+        </div>
+    </div>
+
+    <!-- Header -->
+    <header class="mb-6">
+        <h1 class="header-title text-4xl md:text-6xl text-center">
+            MÖRK BORG
+        </h1>
+        <h2 class="text-center text-fuchsia-400 text-lg uppercase tracking-[0.1em]">
+            ONLINE MISERY
+        </h2>
+        
+        <!-- Game/User Info -->
+        <div class="text-center text-neutral-500 text-xs mt-4 space-y-1">
+            <div>GAME ID: <span id="game-id-display" class="text-neutral-400">...</span> (SHARE URL TO INVITE)</div>
+            <div>YOUR ID: <span id="user-id-display" class="text-neutral-400">...</span></div>
+        </div>
+    </header>
+
+    <!-- Main Content Grid -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+        <!-- Left Column: Your Sheet & Dice -->
+        <div class="lg:col-span-1 space-y-6">
+            
+            <!-- Your Character Sheet -->
+            <section class="bg-neutral-950 border border-yellow-300 p-4">
+                <h2 class="text-2xl text-yellow-300 font-bold tracking-widest uppercase mb-4">YOUR SCVM</h2>
+                <form id="character-form" class="space-y-3">
+                    <div>
+                        <label for="char-name" class="text-sm text-neutral-400 uppercase tracking-wider">NAME</label>
+                        <input type="text" id="char-name" name="char-name" class="form-input mt-1">
+                    </div>
+                    
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label for="char-hp" class="text-sm text-neutral-400 uppercase tracking-wider">HP</label>
+                            <input type="number" id="char-hp" name="char-hp" class="form-input mt-1">
+                        </div>
+                        <div>
+                            <label for="char-omens" class="text-sm text-neutral-400 uppercase tracking-wider">OMENS</label>
+                            <input type="number" id="char-omens" name="char-omens" class="form-input mt-1">
+                        </div>
+                    </div>
+                    
+                    <div class="grid grid-cols-4 gap-2">
+                        <div>
+                            <label for="char-agility" class="text-sm text-neutral-400 uppercase tracking-wider">AGI</label>
+                            <input type="number" id="char-agility" name="char-agility" class="form-input mt-1 text-center">
+                        </div>
+                        <div>
+                            <label for="char-presence" class="text-sm text-neutral-400 uppercase tracking-wider">PRE</label>
+                            <input type="number" id="char-presence" name="char-presence" class="form-input mt-1 text-center">
+                        </div>
+                        <div>
+                            <label for="char-strength" class="text-sm text-neutral-400 uppercase tracking-wider">STR</label>
+                            <input type="number" id="char-strength" name="char-strength" class="form-input mt-1 text-center">
+                        </div>
+                        <div>
+                            <label for="char-toughness" class="text-sm text-neutral-400 uppercase tracking-wider">TOU</label>
+                            <input type="number" id="char-toughness" name="char-toughness" class="form-input mt-1 text-center">
+                        </div>
+                    </div>
+                    
+                    <div>
+                        <label for="char-notes" class="text-sm text-neutral-400 uppercase tracking-wider">NOTES / EQUIPMENT</label>
+                        <textarea id="char-notes" name="char-notes" rows="4" class="form-input mt-1 align-top"></textarea>
+                    </div>
+                </form>
+            </section>
+            
+            <!-- Dice Roller -->
+            <section class="bg-neutral-950 border border-neutral-800 p-4">
+                <h2 class="text-2xl text-white font-bold tracking-widest uppercase mb-4">ROLL DICE</h2>
+                <div class="grid grid-cols-4 gap-2">
+                    <button id="roll-d2" class="btn-dice">D2</button>
+                    <button id="roll-d4" class="btn-dice">D4</button>
+                    <button id="roll-d6" class="btn-dice">D6</button>
+                    <button id="roll-d8" class="btn-dice">D8</button>
+                    <button id="roll-d10" class="btn-dice">D10</button>
+                    <button id="roll-d12" class="btn-dice">D12</button>
+                    <button id="roll-d20" class="btn-dice">D20</button>
+                    <button id="roll-d100" class="btn-dice">D100</button>
+                </div>
+            </section>
+        </div>
+
+        <!-- Right Column: Log & Other Players -->
+        <div class="lg:col-span-2 space-y-6">
+            
+            <!-- Shared Log -->
+            <section class="bg-neutral-950 border border-neutral-800 p-4">
+                <h2 class="text-2xl text-white font-bold tracking-widest uppercase mb-4">SHARED LOG</h2>
+                <div id="log-container" class="h-64 overflow-y-auto bg-black p-2 font-mono text-sm border border-neutral-700">
+                    <!-- Log entries will be injected here by JS -->
+                </div>
+            </section>
+            
+            <!-- Other Players -->
+            <section class="border border-neutral-800 p-4">
+                <h2 class="text-2xl text-white font-bold tracking-widest uppercase mb-4">THE PARTY</h2>
+                <div id="characters-container" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <!-- Other character sheets will be injected here by JS -->
+                </div>
+            </section>
+            
+        </div>
+    </div>
+
+</body>
+</html>
